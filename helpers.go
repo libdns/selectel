@@ -8,323 +8,495 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/libdns/libdns"
-	"golang.org/x/net/idna"
 )
 
-// httpError represents a non-2xx HTTP response from the Selectel API.
-// It exposes the status code structurally so callers do not have to
-// parse error strings to react to specific HTTP conditions
-// (e.g. 409 Conflict during AppendRecords).
-type httpError struct {
-	StatusCode int
-	Status     string
-	Body       string
+// ----- Name helpers ---------------------------------------------------------
+
+// normalizeZone returns zone as a lower-case FQDN with a trailing dot.
+func normalizeZone(zone string) string {
+	zone = strings.ToLower(strings.TrimSpace(zone))
+	if !strings.HasSuffix(zone, ".") {
+		zone += "."
+	}
+	return zone
 }
 
-func (e *httpError) Error() string {
-	return fmt.Sprintf("%s (%d): %s", e.Status, e.StatusCode, e.Body)
+// ensureTrailingDot returns s with a trailing dot appended if missing.
+func ensureTrailingDot(s string) string {
+	if strings.HasSuffix(s, ".") {
+		return s
+	}
+	return s + "."
 }
 
-// deserialization unmarshals a JSON payload into a value of type T.
-func deserialization[T any](data []byte) (T, error) {
-	var result T
-	if err := json.Unmarshal(data, &result); err != nil {
-		return result, err
-	}
-	return result, nil
+// recordFQDN returns the FQDN (with trailing dot) for a libdns record name
+// relative to zone. Zone must already be normalised (trailing dot).
+func recordFQDN(name, zone string) string {
+	return strings.ToLower(libdns.AbsoluteName(name, zone))
 }
 
-// urlGenerator builds an absolute API URL from a path template and
-// optional positional arguments (substituted via fmt.Sprintf).
-func urlGenerator(path string, args ...interface{}) string {
-	return fmt.Sprintf(cApiBaseUrl+path, args...)
+// recordRelName returns the record name relative to zone (no trailing dot).
+// Zone must already be normalised (trailing dot).
+func recordRelName(fqdn, zone string) string {
+	rel := libdns.RelativeName(fqdn, zone)
+	if rel == "" {
+		return "@"
+	}
+	return rel
 }
 
-// makeApiRequest issues an authenticated request to the Selectel API
-// with retry support for transient failures.
-//
-//	ctx    - request context
-//	method - HTTP method (GET, POST, DELETE, PATCH, PUT)
-//	path   - path template (joined with cApiBaseUrl, fed to fmt.Sprintf)
-//	body   - optional request body
-//	args   - positional substitutions for path
-func (p *Provider) makeApiRequest(ctx context.Context, method string, path string, body io.Reader, args ...interface{}) ([]byte, error) {
-	return p.executeHTTPRequestWithRetryLogic(ctx, method, path, body, args...)
+// ----- TTL helpers ----------------------------------------------------------
+
+// clampTTL returns ttl clamped to the Selectel-accepted range [cMinTTL, cMaxTTL].
+func clampTTL(ttl int) int {
+	if ttl < cMinTTL {
+		return cMinTTL
+	}
+	if ttl > cMaxTTL {
+		return cMaxTTL
+	}
+	return ttl
 }
 
-// getZoneID resolves a zone name to its Selectel zone ID, caching the
-// result on the provider for subsequent calls.
-func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
-	p.writeDebugLogMessage("GET_ZONE_ID", "Looking up zone ID for zone: %s", zone)
+// ----- Content / Data conversion --------------------------------------------
 
-	if zoneId := p.ZonesCache[zone]; zoneId != "" {
-		p.writeDebugLogMessage("GET_ZONE_ID", "Found zone ID in cache: %s", zoneId)
-		return zoneId, nil
+// contentToData converts a Selectel API content string to the libdns RR Data
+// field. For TXT records the API wraps values in double quotes; we strip them.
+func contentToData(recType, content string) string {
+	if recType == "TXT" {
+		return stripTXTQuotes(content)
 	}
-
-	p.writeDebugLogMessage("GET_ZONE_ID", "Zone ID not in cache, fetching from API")
-
-	zonesB, err := p.makeApiRequest(ctx, httpMethods.get, fmt.Sprintf("/zones?filter=%s", url.QueryEscape(zone)), nil)
-	if err != nil {
-		p.writeErrorLogMessage("GET_ZONE_ID", "Failed to fetch zones from API: %v", err)
-		return "", fmt.Errorf("failed to fetch zones: %w", err)
-	}
-
-	zones, err := deserialization[Zones](zonesB)
-	if err != nil {
-		p.writeErrorLogMessage("GET_ZONE_ID", "Failed to deserialize zones response: %v", err)
-		return "", fmt.Errorf("failed to deserialize zones: %w", err)
-	}
-
-	if len(zones.Zones) == 0 {
-		p.writeErrorLogMessage("GET_ZONE_ID", "No zones found for zone: %s", zone)
-		return "", fmt.Errorf("no zoneId for zone %s", zone)
-	}
-
-	zoneId := zones.Zones[0].ID
-	p.writeInfoLogMessage("GET_ZONE_ID", "Found zone ID: %s for zone: %s", zoneId, zone)
-
-	if p.ZonesCache == nil {
-		p.ZonesCache = make(map[string]string)
-	}
-	p.ZonesCache[zone] = zoneId
-
-	return zoneId, nil
+	return content
 }
 
-// recordToLibdns converts a Selectel API Record into the libdns.Record
-// representation expected by libdns consumers.
-func recordToLibdns(zone string, record Record) libdns.Record {
-	ttlDuration := time.Duration(record.TTL) * time.Second
-
-	var dataBuilder strings.Builder
-	for i, recVal := range record.Records {
-		if i > 0 {
-			dataBuilder.WriteString("\n")
-		}
-		if record.Type == "TXT" {
-			dataBuilder.WriteString(strings.ReplaceAll(recVal.Content, "\"", ""))
-		} else {
-			dataBuilder.WriteString(recVal.Content)
-		}
+// dataToContent converts a libdns RR Data field to the Selectel API content
+// string. TXT values are wrapped in double quotes as the API requires.
+func dataToContent(recType, data string) string {
+	if recType == "TXT" {
+		return `"` + data + `"`
 	}
-
-	fqdn := nameNormalizer(record.Name, zone)
-	nameRel := libdns.RelativeName(fqdn, zone)
-
-	return libdns.RR{
-		Name: nameRel,
-		TTL:  ttlDuration,
-		Type: record.Type,
-		Data: dataBuilder.String(),
-	}
+	return data
 }
 
-// mapRecordsToLibds converts a slice of Selectel records into libdns
-// records.
-func mapRecordsToLibds(zone string, records []Record) []libdns.Record {
-	libdnsRecords := make([]libdns.Record, len(records))
-	for i, record := range records {
-		libdnsRecords[i] = recordToLibdns(zone, record)
+// stripTXTQuotes removes the outer pair of double quotes from a TXT content
+// value. If the string is not quoted, it is returned unchanged.
+func stripTXTQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
 	}
-	return libdnsRecords
+	return s
 }
 
-// libdnsToRecord converts a libdns.Record into the Selectel API record
-// representation. The Selectel API rejects TTL values below 60, so a
-// zero TTL is silently promoted to 60.
-func libdnsToRecord(zone string, libdnsRecord libdns.Record) Record {
-	rr := libdnsRecord.RR()
+// ----- Record conversion ----------------------------------------------------
 
-	ttl := rr.TTL.Seconds()
-	if ttl < cMinSelectelTTL {
-		ttl = cMinSelectelTTL
-	}
+// apiRecordToLibdns expands a Selectel RRset into individual libdns.Record
+// values — one per RecordItem. Zone must already be normalised.
+func apiRecordToLibdns(zone string, r Record) []libdns.Record {
+	ttl := time.Duration(r.TTL) * time.Second
+	fqdn := ensureTrailingDot(strings.ToLower(r.Name))
+	rel := recordRelName(fqdn, zone)
 
-	if rr.Data == "" {
-		return Record{}
-	}
-
-	recVals := strings.Split(rr.Data, "\n")
-	valueRV := make([]RecordItem, 0, len(recVals))
-	for _, recVal := range recVals {
-		recVal = strings.TrimSpace(recVal)
-		if recVal == "" {
+	out := make([]libdns.Record, 0, len(r.Records))
+	for _, item := range r.Records {
+		if item.Disabled {
 			continue
 		}
-		if rr.Type == "TXT" {
-			recVal = strings.Trim(recVal, "\"")
-			valueRV = append(valueRV, RecordItem{Content: "\"" + recVal + "\"", Disabled: false})
-		} else {
-			valueRV = append(valueRV, RecordItem{Content: recVal, Disabled: false})
-		}
-	}
-
-	if len(valueRV) == 0 {
-		return Record{}
-	}
-
-	fqdn := nameNormalizer(rr.Name, zone)
-	rel := libdns.RelativeName(fqdn, zone)
-
-	var apiName string
-	if rel == "" || rel == "@" || rel == "." {
-		apiName = strings.TrimSuffix(zone, ".")
-	} else {
-		apiName = strings.TrimSuffix(fqdn, ".")
-	}
-
-	return Record{
-		Type:    rr.Type,
-		Name:    apiName,
-		Records: valueRV,
-		TTL:     int(ttl),
-	}
-}
-
-// getSelectelRecords fetches all records of a zone from the Selectel
-// API using the zone ID.
-func (p *Provider) getSelectelRecords(ctx context.Context, zoneId string) ([]Record, error) {
-	p.writeDebugLogMessage("GET_RECORDS", "Fetching records for zone ID: %s", zoneId)
-
-	recordB, err := p.makeApiRequest(ctx, httpMethods.get, "/zones/%s/rrset", nil, zoneId)
-	if err != nil {
-		p.writeErrorLogMessage("GET_RECORDS", "Failed to fetch records for zone ID %s: %v", zoneId, err)
-		return nil, fmt.Errorf("failed to fetch records: %w", err)
-	}
-
-	recordset, err := deserialization[Recordset](recordB)
-	if err != nil {
-		p.writeErrorLogMessage("GET_RECORDS", "Failed to deserialize records response for zone ID %s: %v", zoneId, err)
-		return nil, fmt.Errorf("failed to deserialize records: %w", err)
-	}
-
-	p.writeInfoLogMessage("GET_RECORDS", "Successfully fetched %d records for zone ID: %s", len(recordset.Records), zoneId)
-	return recordset.Records, nil
-}
-
-// updateSelectelRecord patches an existing record by its ID.
-func (p *Provider) updateSelectelRecord(ctx context.Context, zone string, zoneId string, record Record) (Record, error) {
-	p.writeDebugLogMessage("UPDATE_RECORD", "Updating record ID %s for zone %s (zone ID: %s)", record.ID, zone, zoneId)
-
-	body, err := json.Marshal(record)
-	if err != nil {
-		p.writeErrorLogMessage("UPDATE_RECORD", "Failed to marshal record for update: %v", err)
-		return Record{}, fmt.Errorf("failed to marshal record: %w", err)
-	}
-
-	p.writeDebugLogMessage("UPDATE_RECORD", "Sending JSON to API: %s", string(body))
-
-	_, err = p.makeApiRequest(ctx, httpMethods.patch, "/zones/%s/rrset/%s", bytes.NewReader(body), zoneId, record.ID)
-	if err != nil {
-		p.writeErrorLogMessage("UPDATE_RECORD", "Failed to update record ID %s: %v", record.ID, err)
-		return Record{}, fmt.Errorf("failed to update record: %w", err)
-	}
-
-	p.writeInfoLogMessage("UPDATE_RECORD", "Successfully updated record ID %s for zone %s", record.ID, zone)
-	return record, nil
-}
-
-// nameNormalizer normalises a record name to a fully qualified domain
-// name within the given zone.
-//
-//	test          => test.zone.
-//	test.zone     => test.zone.
-//	test.zone.    => test.zone.
-//	test.subzone  => test.subzone.zone.
-func nameNormalizer(name string, zone string) string {
-	name = strings.TrimSpace(name)
-	zone = strings.TrimSuffix(zone, ".")
-
-	if name == "@" || name == "" || name == "." {
-		return zone + "."
-	}
-
-	name = strings.TrimSuffix(name, ".")
-	if name == zone || strings.HasSuffix(name, "."+zone) {
-		return name + "."
-	}
-
-	return name + "." + zone + "."
-}
-
-// idFromRecordsByLibRecord finds an existing Selectel record whose
-// (name, type) pair matches the given libdns record. Comparison is
-// case-insensitive and IDN-aware (both sides are converted to ASCII).
-func (p *Provider) idFromRecordsByLibRecord(records []Record, libRecord libdns.Record, zone string) (string, bool) {
-	rr := libRecord.RR()
-
-	zoneASCII, err := idna.ToASCII(zone)
-	if err != nil {
-		zoneASCII = zone
-	}
-
-	nameNorm := strings.ToLower(strings.TrimSuffix(nameNormalizer(rr.Name, zoneASCII), "."))
-
-	p.writeDebugLogMessage("ID_FROM_RECORDS", "Looking for record: name=%s, type=%s, zone=%s", nameNorm, rr.Type, zoneASCII)
-
-	for _, record := range records {
-		recordNameASCII, err := idna.ToASCII(strings.TrimSuffix(record.Name, "."))
+		data := contentToData(r.Type, item.Content)
+		rr := libdns.RR{Name: rel, TTL: ttl, Type: r.Type, Data: data}
+		parsed, err := rr.Parse()
 		if err != nil {
-			recordNameASCII = strings.TrimSuffix(record.Name, ".")
-		}
-
-		recordNameNorm := strings.ToLower(strings.TrimSuffix(nameNormalizer(recordNameASCII, zoneASCII), "."))
-
-		if recordNameNorm == nameNorm && rr.Type == record.Type {
-			p.writeDebugLogMessage("ID_FROM_RECORDS", "Match found! Returning ID: %s", record.ID)
-			return record.ID, true
+			out = append(out, rr)
+		} else {
+			out = append(out, parsed)
 		}
 	}
-
-	p.writeDebugLogMessage("ID_FROM_RECORDS", "No match found for name=%s, type=%s", nameNorm, rr.Type)
-	return "", false
+	return out
 }
 
-// writeLogMessageWithContext writes a formatted log entry to the
-// provider's OperationLogger. When no logger is configured the call is
-// a no-op.
-func (p *Provider) writeLogMessageWithContext(logLevel, operationName, messageTemplate string, messageArguments ...interface{}) {
-	if p.OperationLogger == nil {
-		return
+// ----- RRset grouping -------------------------------------------------------
+
+// rrGroup represents one (name, type) RRset worth of input records for
+// Append / Set operations.
+type rrGroup struct {
+	fqdn    string       // FQDN with trailing dot
+	typ     string       // e.g. "A", "TXT"
+	ttl     int          // clamped TTL
+	items   []RecordItem // values to write to the API
+	srcRecs []libdns.Record
+}
+
+// groupByNameType partitions records into rrGroups keyed by (FQDN, type).
+// Ordering of groups follows first occurrence in the input. Zone must
+// already be normalised.
+func groupByNameType(zone string, records []libdns.Record) []rrGroup {
+	type key struct{ fqdn, typ string }
+	var order []key
+	groups := map[key]*rrGroup{}
+
+	for _, r := range records {
+		rr := r.RR()
+		fqdn := recordFQDN(rr.Name, zone)
+		typ := strings.ToUpper(rr.Type)
+		k := key{fqdn, typ}
+
+		g, ok := groups[k]
+		if !ok {
+			g = &rrGroup{fqdn: fqdn, typ: typ}
+			groups[k] = g
+			order = append(order, k)
+		}
+
+		ttl := clampTTL(int(rr.TTL.Seconds()))
+		if g.ttl == 0 {
+			g.ttl = ttl
+		}
+
+		if rr.Data != "" {
+			g.items = append(g.items, RecordItem{Content: dataToContent(typ, rr.Data)})
+			g.srcRecs = append(g.srcRecs, r)
+		}
 	}
 
-	formattedMessage := fmt.Sprintf(messageTemplate, messageArguments...)
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	p.OperationLogger.Printf("[%s] [%s] [%s] %s", timestamp, logLevel, operationName, formattedMessage)
-}
-
-// writeDebugLogMessage emits a DEBUG-level log entry. Suppressed when
-// EnableDebugLogging is false.
-func (p *Provider) writeDebugLogMessage(operationName, messageTemplate string, messageArguments ...interface{}) {
-	if !p.EnableDebugLogging {
-		return
+	result := make([]rrGroup, 0, len(order))
+	for _, k := range order {
+		result = append(result, *groups[k])
 	}
-	p.writeLogMessageWithContext("DEBUG", operationName, messageTemplate, messageArguments...)
+	return result
 }
 
-// writeInfoLogMessage emits an INFO-level log entry.
-func (p *Provider) writeInfoLogMessage(operationName, messageTemplate string, messageArguments ...interface{}) {
-	p.writeLogMessageWithContext("INFO", operationName, messageTemplate, messageArguments...)
+// ----- Zone ID resolution ---------------------------------------------------
+
+// getZoneID returns the Selectel zone ID for zone, using the cache when
+// available and fetching from the API otherwise. Zone must already be
+// normalised (lower-case, trailing dot).
+func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
+	nz := normalizeZone(zone)
+
+	p.cacheMu.RLock()
+	id := p.zoneCache[nz]
+	p.cacheMu.RUnlock()
+
+	if id != "" {
+		p.logDebug("GET_ZONE_ID", "Zone %q found in cache: %s", nz, id)
+		return id, nil
+	}
+
+	p.logDebug("GET_ZONE_ID", "Fetching zone ID for %q from API", nz)
+
+	var offset int
+	for {
+		apiURL := p.getAPIBase() + "/zones?" + url.Values{
+			"filter": {nz},
+			"limit":  {strconv.Itoa(cPageSize)},
+			"offset": {strconv.Itoa(offset)},
+		}.Encode()
+
+		data, err := p.makeAPIRequest(ctx, httpGET, apiURL, nil)
+		if err != nil {
+			p.logError("GET_ZONE_ID", "API error for zone %q: %v", nz, err)
+			return "", fmt.Errorf("get zone %q: %w", nz, err)
+		}
+
+		var page paginatedZones
+		if err := json.Unmarshal(data, &page); err != nil {
+			return "", fmt.Errorf("unmarshal zones: %w", err)
+		}
+
+		for _, z := range page.Result {
+			// Exact FQDN match (case-insensitive).
+			if strings.EqualFold(ensureTrailingDot(z.Name), nz) {
+				p.logInfo("GET_ZONE_ID", "Resolved zone %q → ID %s", nz, z.ID)
+				p.cacheMu.Lock()
+				if p.zoneCache == nil {
+					p.zoneCache = make(map[string]string)
+				}
+				p.zoneCache[nz] = z.ID
+				p.cacheMu.Unlock()
+				return z.ID, nil
+			}
+		}
+
+		if page.NextOffset <= 0 || len(page.Result) == 0 {
+			break
+		}
+		offset = page.NextOffset
+	}
+
+	p.logError("GET_ZONE_ID", "Zone %q not found", nz)
+	return "", fmt.Errorf("zone %q not found in Selectel account", nz)
 }
 
-// writeErrorLogMessage emits an ERROR-level log entry.
-func (p *Provider) writeErrorLogMessage(operationName, messageTemplate string, messageArguments ...interface{}) {
-	p.writeLogMessageWithContext("ERROR", operationName, messageTemplate, messageArguments...)
+// ----- RRset API helpers ----------------------------------------------------
+
+// listAllRRsets returns every RRset in the zone using pagination.
+func (p *Provider) listAllRRsets(ctx context.Context, zoneID string) ([]Record, error) {
+	return p.listRRsetsPaged(ctx, zoneID, nil)
 }
 
-// shouldRetryHTTPRequest reports whether a failed request should be
-// retried based on the underlying error and HTTP status code.
-func shouldRetryHTTPRequest(requestError error, httpStatusCode int) bool {
-	switch httpStatusCode {
-	case http.StatusConflict:
-		return false
+// getRRset fetches a single RRset by (FQDN, type). Returns nil, nil when the
+// RRset does not exist. fqdn must be a FQDN with a trailing dot.
+func (p *Provider) getRRset(ctx context.Context, zoneID, fqdn, rrType string) (*Record, error) {
+	params := url.Values{
+		"name":        {fqdn},
+		"rrset_types": {rrType},
+	}
+	rrsets, err := p.listRRsetsPaged(ctx, zoneID, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(rrsets) == 0 {
+		return nil, nil
+	}
+	return &rrsets[0], nil
+}
+
+// listRRsetsAtName returns all RRsets (any type) for a given FQDN.
+func (p *Provider) listRRsetsAtName(ctx context.Context, zoneID, fqdn string) ([]Record, error) {
+	return p.listRRsetsPaged(ctx, zoneID, url.Values{"name": {fqdn}})
+}
+
+// listRRsetsPaged fetches all RRsets for a zone using cursor-based pagination,
+// merging optional extra query params. zoneID is the Selectel zone UUID.
+func (p *Provider) listRRsetsPaged(ctx context.Context, zoneID string, extraParams url.Values) ([]Record, error) {
+	var all []Record
+
+	for offset := 0; ; {
+		qp := url.Values{
+			"limit":  {strconv.Itoa(cPageSize)},
+			"offset": {strconv.Itoa(offset)},
+		}
+		for k, v := range extraParams {
+			qp[k] = v
+		}
+
+		apiURL := p.getAPIBase() + fmt.Sprintf("/zones/%s/rrset?", zoneID) + qp.Encode()
+		data, err := p.makeAPIRequest(ctx, httpGET, apiURL, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var page paginatedRRsets
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, fmt.Errorf("unmarshal rrsets: %w", err)
+		}
+
+		all = append(all, page.Result...)
+
+		if page.NextOffset <= 0 || len(all) >= page.Count {
+			break
+		}
+		offset = page.NextOffset
+	}
+
+	return all, nil
+}
+
+// createRRset issues POST /zones/{zoneID}/rrset and returns the newly created
+// records as libdns values. zone must already be normalised.
+func (p *Provider) createRRset(ctx context.Context, zoneID, zone string, grp rrGroup) ([]libdns.Record, error) {
+	p.logDebug("CREATE_RRSET", "Creating %s RRset %q in zone %s (TTL %d, %d values)",
+		grp.typ, grp.fqdn, zone, grp.ttl, len(grp.items))
+
+	payload := rrsetCreatePayload{
+		Name:    grp.fqdn,
+		TTL:     grp.ttl,
+		Type:    grp.typ,
+		Records: grp.items,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal create payload: %w", err)
+	}
+
+	apiURL := p.getAPIBase() + fmt.Sprintf("/zones/%s/rrset", zoneID)
+	if _, err := p.makeAPIRequest(ctx, httpPOST, apiURL, body); err != nil {
+		p.logError("CREATE_RRSET", "Failed to create RRset %q/%s: %v", grp.fqdn, grp.typ, err)
+		return nil, fmt.Errorf("create rrset %s/%s: %w", grp.fqdn, grp.typ, err)
+	}
+
+	p.logInfo("CREATE_RRSET", "Created %s RRset %q", grp.typ, grp.fqdn)
+	return grp.srcRecs, nil
+}
+
+// patchRRset issues PATCH /zones/{zoneID}/rrset/{rrsetID}.
+func (p *Provider) patchRRset(ctx context.Context, zoneID, rrsetID string, payload rrsetUpdatePayload) error {
+	p.logDebug("PATCH_RRSET", "Patching RRset %s (TTL %d, %d values)", rrsetID, payload.TTL, len(payload.Records))
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal patch payload: %w", err)
+	}
+
+	apiURL := p.getAPIBase() + fmt.Sprintf("/zones/%s/rrset/%s", zoneID, rrsetID)
+	if _, err := p.makeAPIRequest(ctx, httpPATCH, apiURL, body); err != nil {
+		p.logError("PATCH_RRSET", "Failed to patch RRset %s: %v", rrsetID, err)
+		return fmt.Errorf("patch rrset %s: %w", rrsetID, err)
+	}
+
+	p.logInfo("PATCH_RRSET", "Patched RRset %s", rrsetID)
+	return nil
+}
+
+// deleteRRset issues DELETE /zones/{zoneID}/rrset/{rrsetID}.
+func (p *Provider) deleteRRset(ctx context.Context, zoneID, rrsetID string) error {
+	p.logDebug("DELETE_RRSET", "Deleting RRset %s", rrsetID)
+
+	apiURL := p.getAPIBase() + fmt.Sprintf("/zones/%s/rrset/%s", zoneID, rrsetID)
+	if _, err := p.makeAPIRequest(ctx, httpDELETE, apiURL, nil); err != nil {
+		p.logError("DELETE_RRSET", "Failed to delete RRset %s: %v", rrsetID, err)
+		return fmt.Errorf("delete rrset %s: %w", rrsetID, err)
+	}
+
+	p.logInfo("DELETE_RRSET", "Deleted RRset %s", rrsetID)
+	return nil
+}
+
+// ----- HTTP layer -----------------------------------------------------------
+
+// makeAPIRequest issues an authenticated, retried API request and returns the
+// raw response body. body may be nil.
+func (p *Provider) makeAPIRequest(ctx context.Context, method, apiURL string, body []byte) ([]byte, error) {
+	p.logDebug("HTTP", "→ %s %s", method, apiURL)
+	return p.executeWithRetry(ctx, method, apiURL, body)
+}
+
+// executeWithRetry runs the request with retry logic for transient errors and
+// automatic token refresh on 401.
+func (p *Provider) executeWithRetry(ctx context.Context, method, apiURL string, body []byte) ([]byte, error) {
+	cfg := p.effectiveRetryConfig()
+	var lastErr error
+	retries := 0
+	reAuthed := false
+
+	for {
+		staleToken := p.currentToken()
+
+		var bodyReader io.Reader
+		if body != nil {
+			bodyReader = bytes.NewReader(body)
+		}
+
+		data, err := p.executeSingleRequest(ctx, method, apiURL, bodyReader, staleToken)
+		if err == nil {
+			if retries > 0 {
+				p.logInfo("HTTP", "Request succeeded on attempt %d", retries+1)
+			}
+			return data, nil
+		}
+
+		lastErr = err
+		p.logError("HTTP", "Attempt %d failed: %v", retries+1, err)
+
+		// On 401: re-authenticate once, then retry immediately.
+		var httpErr *httpError
+		if errors.As(err, &httpErr) && httpErr.isUnauthorized() && !reAuthed {
+			reAuthed = true
+			p.logDebug("HTTP", "401 received — re-authenticating")
+			if authErr := p.ensureTokenNotStale(ctx, staleToken); authErr != nil {
+				p.logError("HTTP", "Re-authentication failed: %v", authErr)
+				return nil, authErr
+			}
+			continue // retry without counting as a regular retry
+		}
+
+		// Check retry eligibility.
+		if retries >= cfg.MaximumRetryAttempts {
+			break
+		}
+		sc := 0
+		if errors.As(err, &httpErr) {
+			sc = httpErr.StatusCode
+		}
+		if !shouldRetry(err, sc) {
+			p.logDebug("HTTP", "Error is not retryable")
+			break
+		}
+
+		retries++
+		backoff := p.backoffDelay(cfg, retries-1)
+		p.logDebug("HTTP", "Retry %d/%d after %v", retries, cfg.MaximumRetryAttempts, backoff)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	return nil, fmt.Errorf("request failed after %d attempt(s): %w", retries+1, lastErr)
+}
+
+// executeSingleRequest performs one HTTP round-trip. Non-2xx responses are
+// returned as *httpError so callers can inspect the status code.
+func (p *Provider) executeSingleRequest(ctx context.Context, method, apiURL string, body io.Reader, token string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, apiURL, body)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("X-Auth-Token", token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", cUserAgent)
+
+	resp, err := p.sharedClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, cResponseBodyLimit))
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, buildHTTPError(resp.StatusCode, respBody)
+	}
+
+	return respBody, nil
+}
+
+// buildHTTPError constructs an *httpError, parsing the Selectel structured
+// error body when possible and falling back to a raw body excerpt.
+func buildHTTPError(statusCode int, body []byte) *httpError {
+	e := &httpError{
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
+	}
+
+	var apiErr apiErrorBody
+	if json.Unmarshal(body, &apiErr) == nil {
+		if apiErr.Description != "" {
+			e.Message = apiErr.Description
+			return e
+		}
+		if apiErr.Error != "" {
+			e.Message = apiErr.Error
+			return e
+		}
+	}
+
+	if len(body) > 0 {
+		excerpt := string(body)
+		if len(excerpt) > 200 {
+			excerpt = excerpt[:200] + "…"
+		}
+		e.Message = excerpt
+	}
+
+	return e
+}
+
+// shouldRetry reports whether a failed request should be retried.
+func shouldRetry(err error, statusCode int) bool {
+	switch statusCode {
 	case http.StatusTooManyRequests,
 		http.StatusInternalServerError,
 		http.StatusBadGateway,
@@ -333,136 +505,48 @@ func shouldRetryHTTPRequest(requestError error, httpStatusCode int) bool {
 		return true
 	}
 
-	if requestError != nil {
-		errMsg := requestError.Error()
-		if strings.Contains(errMsg, "timeout") ||
-			strings.Contains(errMsg, "connection refused") ||
-			strings.Contains(errMsg, "no such host") ||
-			strings.Contains(errMsg, "EOF") {
-			return true
-		}
+	if err == nil {
+		return false
+	}
+
+	// Never retry context cancellation or deadline.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Network-level timeout.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	// Unexpected EOF / connection reset.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	// Generic network operation failure (includes connection refused, DNS failure).
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
 	}
 
 	return false
 }
 
-// effectiveRetryConfiguration returns the retry configuration to use
-// for the next request. A zero-value HTTPRequestRetryConfiguration is
-// treated as "use defaults"; any explicitly populated configuration is
-// honoured as-is.
-func (p *Provider) effectiveRetryConfiguration() HTTPRequestRetryConfiguration {
+// ----- Retry helpers --------------------------------------------------------
+
+func (p *Provider) effectiveRetryConfig() HTTPRequestRetryConfiguration {
 	if p.HTTPRequestRetryConfiguration == (HTTPRequestRetryConfiguration{}) {
 		return CreateDefaultHTTPRequestRetryConfiguration()
 	}
 	return p.HTTPRequestRetryConfiguration
 }
 
-// calculateExponentialBackoffDelay computes the wait duration before
-// the given retry attempt (0-indexed). The result is capped at
-// MaximumRetryDelay.
-func (p *Provider) calculateExponentialBackoffDelay(cfg HTTPRequestRetryConfiguration, retryAttemptNumber int) time.Duration {
-	delay := time.Duration(float64(cfg.InitialRetryDelay) * math.Pow(cfg.ExponentialBackoffMultiplier, float64(retryAttemptNumber)))
-	if delay > cfg.MaximumRetryDelay {
-		delay = cfg.MaximumRetryDelay
+func (p *Provider) backoffDelay(cfg HTTPRequestRetryConfiguration, attempt int) time.Duration {
+	d := time.Duration(float64(cfg.InitialRetryDelay) * math.Pow(cfg.ExponentialBackoffMultiplier, float64(attempt)))
+	if d > cfg.MaximumRetryDelay {
+		d = cfg.MaximumRetryDelay
 	}
-	return delay
-}
-
-// executeHTTPRequestWithRetryLogic runs an API request with retries
-// based on the provider's HTTPRequestRetryConfiguration. The request
-// body, if any, is buffered once so it can be replayed on each retry.
-func (p *Provider) executeHTTPRequestWithRetryLogic(ctx context.Context, httpMethod, requestURL string, requestBody io.Reader, pathArguments ...interface{}) ([]byte, error) {
-	requestURL = urlGenerator(requestURL, pathArguments...)
-	p.writeDebugLogMessage("HTTP_REQUEST", "Starting %s request to %s", httpMethod, requestURL)
-
-	var bodyBytes []byte
-	if requestBody != nil {
-		var err error
-		bodyBytes, err = io.ReadAll(requestBody)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read request body: %w", err)
-		}
-	}
-
-	cfg := p.effectiveRetryConfiguration()
-	var lastRequestError error
-
-	for retryAttempt := 0; retryAttempt <= cfg.MaximumRetryAttempts; retryAttempt++ {
-		if retryAttempt > 0 {
-			backoffDelay := p.calculateExponentialBackoffDelay(cfg, retryAttempt-1)
-			p.writeDebugLogMessage("HTTP_REQUEST", "Retry attempt %d/%d after %v delay", retryAttempt, cfg.MaximumRetryAttempts, backoffDelay)
-
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoffDelay):
-			}
-		}
-
-		var bodyReader io.Reader
-		if bodyBytes != nil {
-			bodyReader = bytes.NewReader(bodyBytes)
-		}
-
-		responseData, requestError := p.executeSingleHTTPRequest(ctx, httpMethod, requestURL, bodyReader)
-		if requestError == nil {
-			if retryAttempt > 0 {
-				p.writeInfoLogMessage("HTTP_REQUEST", "Request succeeded on attempt %d", retryAttempt+1)
-			}
-			return responseData, nil
-		}
-
-		lastRequestError = requestError
-
-		var statusCode int
-		var httpErr *httpError
-		if errors.As(requestError, &httpErr) {
-			statusCode = httpErr.StatusCode
-		}
-
-		p.writeErrorLogMessage("HTTP_REQUEST", "Request failed on attempt %d: %v", retryAttempt+1, requestError)
-
-		if !shouldRetryHTTPRequest(requestError, statusCode) {
-			p.writeDebugLogMessage("HTTP_REQUEST", "Error is not retryable, stopping retries")
-			break
-		}
-	}
-
-	p.writeErrorLogMessage("HTTP_REQUEST", "All retry attempts exhausted for %s %s", httpMethod, requestURL)
-	return nil, fmt.Errorf("request failed after %d attempts: %w", cfg.MaximumRetryAttempts+1, lastRequestError)
-}
-
-// executeSingleHTTPRequest performs a single HTTP round-trip and
-// returns either the response body or an error. Non-2xx responses are
-// returned as *httpError so callers can react to specific status codes.
-func (p *Provider) executeSingleHTTPRequest(ctx context.Context, httpMethod, requestURL string, requestBody io.Reader) ([]byte, error) {
-	httpRequest, err := http.NewRequestWithContext(ctx, httpMethod, requestURL, requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpRequest.Header.Add("X-Auth-Token", p.KeystoneToken)
-	httpRequest.Header.Add("Content-Type", "application/json")
-
-	httpClient := &http.Client{Timeout: cHTTPClientTimeout}
-	httpResponse, err := httpClient.Do(httpRequest)
-	if err != nil {
-		return nil, fmt.Errorf("request execution failed: %w", err)
-	}
-	defer httpResponse.Body.Close()
-
-	responseBodyData, err := io.ReadAll(httpResponse.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		return nil, &httpError{
-			StatusCode: httpResponse.StatusCode,
-			Status:     http.StatusText(httpResponse.StatusCode),
-			Body:       string(responseBodyData),
-		}
-	}
-
-	return responseBodyData, nil
+	return d
 }

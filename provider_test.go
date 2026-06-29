@@ -1,10 +1,11 @@
+//go:build integration
+
 package selectel_test
 
 import (
 	"context"
 	"fmt"
 	"os"
-	"reflect"
 	"testing"
 	"time"
 
@@ -12,19 +13,16 @@ import (
 	"github.com/libdns/libdns"
 	selectel "github.com/libdns/selectel"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// ----- Integration test scaffolding --------------------------------------
-
-// setupIntegration loads credentials from .env (if present) and the
-// process environment, and returns a configured Provider together with
-// the target zone. If the required SELECTEL_* variables are not
-// available, the test is skipped rather than failing - this lets
-// `go test ./...` run cleanly on machines without Selectel credentials.
+// setupIntegration loads credentials from .env (if present) and the process
+// environment, then returns a configured Provider and the target zone. Required
+// SELECTEL_* variables must all be present; otherwise the test is skipped.
 func setupIntegration(t *testing.T) (*selectel.Provider, string, context.Context) {
 	t.Helper()
 
-	// .env is optional. Ignore the error if it does not exist.
+	// .env is optional – ignore absence.
 	_ = godotenv.Load(".env")
 
 	required := []string{
@@ -41,116 +39,130 @@ func setupIntegration(t *testing.T) (*selectel.Provider, string, context.Context
 	}
 
 	provider := &selectel.Provider{
-		User:        os.Getenv("SELECTEL_USER"),
-		Password:    os.Getenv("SELECTEL_PASSWORD"),
-		AccountId:   os.Getenv("SELECTEL_ACCOUNT_ID"),
-		ProjectName: os.Getenv("SELECTEL_PROJECT_NAME"),
-		ZonesCache:  make(map[string]string),
+		User:               os.Getenv("SELECTEL_USER"),
+		Password:           os.Getenv("SELECTEL_PASSWORD"),
+		AccountId:          os.Getenv("SELECTEL_ACCOUNT_ID"),
+		ProjectName:        os.Getenv("SELECTEL_PROJECT_NAME"),
+		EnableDebugLogging: true,
 	}
 	return provider, os.Getenv("SELECTEL_ZONE"), context.Background()
 }
 
-func sampleRecords(zone string) []libdns.Record {
+// integrationRecords returns a set of test records relative to the given zone.
+func integrationRecords(zone string) []libdns.Record {
 	return []libdns.Record{
-		libdns.RR{Type: "A", Name: fmt.Sprintf("test1.%s.", zone), Data: "1.2.3.1", TTL: 61 * time.Second},
-		libdns.RR{Type: "A", Name: fmt.Sprintf("test2.%s.", zone), Data: "1.2.3.2", TTL: 61 * time.Second},
-		libdns.RR{Type: "A", Name: "test3", Data: "1.2.3.3", TTL: 61 * time.Second},
-		libdns.RR{Type: "TXT", Name: "test1", Data: "test1 txt", TTL: 61 * time.Second},
-		libdns.RR{Type: "TXT", Name: fmt.Sprintf("test2.%s.", zone), Data: "test2 txt", TTL: 61 * time.Second},
-		libdns.RR{Type: "TXT", Name: "test3", Data: "test3 txt", TTL: 61 * time.Second},
+		libdns.RR{Type: "A", Name: fmt.Sprintf("libdns-inttest-1.%s.", zone), Data: "1.2.3.1", TTL: 61 * time.Second},
+		libdns.RR{Type: "A", Name: "libdns-inttest-2", Data: "1.2.3.2", TTL: 61 * time.Second},
+		libdns.RR{Type: "TXT", Name: "libdns-inttest-1", Data: "txt value one", TTL: 61 * time.Second},
+		libdns.RR{Type: "TXT", Name: fmt.Sprintf("libdns-inttest-2.%s.", zone), Data: "txt value two", TTL: 61 * time.Second},
 	}
 }
 
-// ----- Integration tests --------------------------------------------------
+// ----- ListZones ------------------------------------------------------------
+
+func TestProvider_ListZones(t *testing.T) {
+	provider, zone, ctx := setupIntegration(t)
+
+	zones, err := provider.ListZones(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, zones, "expected at least one zone")
+
+	var found bool
+	for _, z := range zones {
+		if z.Name == zone || z.Name == zone+"." {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "test zone %q not found in ListZones response", zone)
+	t.Logf("ListZones: %d zone(s)", len(zones))
+}
+
+// ----- GetRecords -----------------------------------------------------------
 
 func TestProvider_GetRecords(t *testing.T) {
 	provider, zone, ctx := setupIntegration(t)
 
-	// best-effort cleanup of any leftover records from previous runs
-	_, _ = provider.DeleteRecords(ctx, zone, sampleRecords(zone))
+	// Best-effort cleanup of leftovers from previous runs.
+	_, _ = provider.DeleteRecords(ctx, zone, integrationRecords(zone))
 
 	records, err := provider.GetRecords(ctx, zone)
-	assert.NoError(t, err)
-	assert.NotNil(t, records)
-	assert.True(t, len(records) > 0, "no records found")
-	t.Logf("GetRecords: %d records found", len(records))
+	require.NoError(t, err)
+	require.NotNil(t, records)
+	assert.NotEmpty(t, records, "expected at least one record in zone")
+	t.Logf("GetRecords: %d record(s)", len(records))
 }
+
+// ----- AppendRecords --------------------------------------------------------
 
 func TestProvider_AppendRecords(t *testing.T) {
 	provider, zone, ctx := setupIntegration(t)
+	t.Cleanup(func() {
+		_, _ = provider.DeleteRecords(ctx, zone, integrationRecords(zone))
+	})
 
-	newRecords := []libdns.Record{
-		libdns.RR{Type: "A", Name: "append-test1", Data: "1.2.3.1", TTL: 300 * time.Second},
-		libdns.RR{Type: "TXT", Name: "append-test2", Data: "append test record", TTL: 300 * time.Second},
+	recs := []libdns.Record{
+		libdns.RR{Type: "A", Name: "libdns-inttest-append", Data: "10.0.0.1", TTL: 300 * time.Second},
+		libdns.RR{Type: "TXT", Name: "libdns-inttest-append", Data: "append test", TTL: 300 * time.Second},
 	}
 
-	records, err := provider.AppendRecords(ctx, zone, newRecords)
-	if err != nil {
-		t.Logf("AppendRecords error: %v", err)
-	}
-	assert.NotNil(t, records)
-	assert.True(t, len(records) > 0, "should have created at least one record")
-	if len(records) > 0 {
-		assert.Equal(t, "A", records[0].RR().Type)
-	}
+	created, err := provider.AppendRecords(ctx, zone, recs)
+	require.NoError(t, err)
+	assert.Len(t, created, 2, "expected 2 records created")
+
+	// Appending the same records again must not fail and must not duplicate.
+	created2, err := provider.AppendRecords(ctx, zone, recs)
+	require.NoError(t, err)
+	assert.Empty(t, created2, "second append of identical records should return nothing new")
+
+	// Cleanup
+	_, _ = provider.DeleteRecords(ctx, zone, recs)
 }
+
+// ----- SetRecords -----------------------------------------------------------
 
 func TestProvider_SetRecords(t *testing.T) {
 	provider, zone, ctx := setupIntegration(t)
 
-	setRecords := []libdns.Record{
-		libdns.RR{Type: "A", Name: "set-test1", Data: "1.2.3.1", TTL: 62 * time.Second},
-		libdns.RR{Type: "TXT", Name: "set-test2", Data: "test txt record", TTL: 300 * time.Second},
+	recs := []libdns.Record{
+		libdns.RR{Type: "A", Name: "libdns-inttest-set", Data: "10.0.0.1", TTL: 62 * time.Second},
 	}
 
-	records, err := provider.SetRecords(ctx, zone, setRecords)
-	if err != nil {
-		t.Logf("SetRecords error: %v", err)
+	t.Cleanup(func() {
+		_, _ = provider.DeleteRecords(ctx, zone, recs)
+	})
+
+	set, err := provider.SetRecords(ctx, zone, recs)
+	require.NoError(t, err)
+	assert.NotEmpty(t, set)
+
+	// SetRecords again with different value should replace, not add.
+	recs2 := []libdns.Record{
+		libdns.RR{Type: "A", Name: "libdns-inttest-set", Data: "10.0.0.2", TTL: 62 * time.Second},
 	}
-	assert.NotNil(t, records)
-	assert.True(t, len(records) > 0, "should have created at least one record")
-	if len(records) > 0 {
-		assert.Equal(t, "A", records[0].RR().Type)
-	}
+	set2, err := provider.SetRecords(ctx, zone, recs2)
+	require.NoError(t, err)
+	assert.NotEmpty(t, set2)
 }
+
+// ----- DeleteRecords --------------------------------------------------------
 
 func TestProvider_DeleteRecords(t *testing.T) {
 	provider, zone, ctx := setupIntegration(t)
 
-	delRecords := []libdns.Record{
-		libdns.RR{Type: "A", Name: "append-test1", Data: "1.2.3.1", TTL: 300 * time.Second},
-		libdns.RR{Type: "TXT", Name: "append-test2", Data: "append test record", TTL: 300 * time.Second},
-		libdns.RR{Type: "A", Name: "set-test1", Data: "1.2.3.1", TTL: 62 * time.Second},
-		libdns.RR{Type: "TXT", Name: "set-test2", Data: "test txt record", TTL: 300 * time.Second},
+	recs := []libdns.Record{
+		libdns.RR{Type: "TXT", Name: "libdns-inttest-del", Data: "delete me", TTL: 300 * time.Second},
 	}
 
-	records, err := provider.DeleteRecords(ctx, zone, delRecords)
-	if err != nil {
-		t.Logf("DeleteRecords error: %v", err)
-	}
-	assert.NotNil(t, records)
-}
+	_, err := provider.AppendRecords(ctx, zone, recs)
+	require.NoError(t, err)
 
-// ----- Unit tests ---------------------------------------------------------
+	deleted, err := provider.DeleteRecords(ctx, zone, recs)
+	require.NoError(t, err)
+	assert.Len(t, deleted, 1)
 
-func TestCreateDefaultHTTPRequestRetryConfiguration(t *testing.T) {
-	cfg := selectel.CreateDefaultHTTPRequestRetryConfiguration()
-	assert.Equal(t, 3, cfg.MaximumRetryAttempts)
-	assert.Equal(t, 1*time.Second, cfg.InitialRetryDelay)
-	assert.Equal(t, 30*time.Second, cfg.MaximumRetryDelay)
-	assert.Equal(t, 2.0, cfg.ExponentialBackoffMultiplier)
-}
-
-func TestHTTPRequestRetryConfiguration_CustomValuesArePreserved(t *testing.T) {
-	custom := selectel.HTTPRequestRetryConfiguration{
-		MaximumRetryAttempts:         5,
-		InitialRetryDelay:            2 * time.Second,
-		MaximumRetryDelay:            60 * time.Second,
-		ExponentialBackoffMultiplier: 1.5,
-	}
-	provider := &selectel.Provider{HTTPRequestRetryConfiguration: custom}
-
-	if !reflect.DeepEqual(provider.HTTPRequestRetryConfiguration, custom) {
-		t.Fatalf("retry configuration was mutated: got %+v want %+v", provider.HTTPRequestRetryConfiguration, custom)
-	}
+	// Second delete of the same records should succeed and return nothing.
+	deleted2, err := provider.DeleteRecords(ctx, zone, recs)
+	require.NoError(t, err)
+	assert.Empty(t, deleted2)
 }
